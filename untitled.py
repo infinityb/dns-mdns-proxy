@@ -1,3 +1,4 @@
+import traceback
 import struct
 import ctypes
 
@@ -6,10 +7,9 @@ import gevent.queue
 import gevent.event
 from gevent import socket
 from dnslib import (
-    OPCODE, QTYPE, RCODE,
+    OPCODE, QTYPE, RCODE, RR, AAAA,
     DNSRecord, DNSQuestion, DNSHeader,
 )
-
 
 if_nametoindex = ctypes.CDLL("libc.so.6").if_nametoindex
 
@@ -53,6 +53,13 @@ class ZeroConfResolutionRequest(gevent.event.AsyncResult):
             self.set(self.responses)
         return have_responses
 
+    def try_get(self, *args, **kwargs):
+        try:
+            return super(ZeroConfResolutionRequest, self).get(*args, **kwargs)
+        except gevent.Timeout:
+            self.set(self.responses)
+        return super(ZeroConfResolutionRequest, self).get(*args, **kwargs)
+
     def begin_request(self):
         pass
 
@@ -85,22 +92,51 @@ class ZeroConfUpstream(object):
         self._zc = zeroconf_listener
 
     def _is_authoritative_for(self, dns_record):
+        # FIXME: robustness
+        return str(dns_record.questions[0].qname).endswith(self._auth_for)
 
-        return True
+    def _mangle_name(self, name):
+        # FIXME: robustness
+        rv = str(name)[:str(name).find(self._auth_for)] + 'local'
+        print "rv = %r" % (rv, )
+        return rv
+
+    def _response_adapt_record(self, dns_record, rr):
+        # import pdb; pdb.set_trace()
+        return RR(
+            dns_record.questions[0].qname,
+            ttl=rr.ttl, rtype=28,
+            rdata=AAAA(rr.rdata.data))
 
     def resolve(self, dns_record):
         if not self._is_authoritative_for(dns_record):
             raise DNSException(RCODE.NOTAUTH)
+
+        if dns_record.questions[0].qtype != QTYPE.AAAA:
+            response = dns_record.reply()
+            response.rr = list()
+            return response
         response = dns_record.reply()
-        print "zc_response wait"
         try:
             zc_response = self._zc.make_request(
-                ZeroConfResolutionRequest('vita.local')).get(timeout=2.0)
-        finally:
-            print "zc_response got|error"
-        response.rr = []
-        for rr in zc_response.rr:
-            response.rr.append(rr)
+                ZeroConfResolutionRequest(
+                    self._mangle_name(dns_record.questions[0].qname),
+                    quick_count=1
+                )
+            ).try_get(timeout=2.0)
+        except Exception:
+            traceback.print_exc()
+            raise
+        else:
+            pass
+        response.rr = list()
+        if not zc_response:
+            response.header.set_rcode(RCODE['Name Error'])
+        for response_rec in zc_response:
+            for rr in response_rec.rr:
+                if rr.rtype == 28 and rr.rdata:
+                    response.add_answer(
+                        self._response_adapt_record(dns_record, rr))
         return response
 
 
@@ -125,18 +161,6 @@ class AuthoritativeDnsServer(BaseDnsServer):
         response.header.set_rcode(exc.rcode)
         return response
 
-    def _response_adapt_record(self, dns_record, rr):
-        #FIXME: mutation of unowned state
-        rr.rname = dns_record.questions[0].qname
-        return rr
-
-    def _handle_with_response(self, dns_record, zc_response):
-        assert OPCODE.QUERY == dns_record.header.opcode
-        response = dns_record.reply()
-        for rr in zc_response.rr:
-            response.add_answer(self._response_adapt_record(dns_record, rr))
-        return response
-
     def _handle_runnable(self, dns_record, address):
         assert OPCODE.QUERY == dns_record.header.opcode
         try:
@@ -148,8 +172,7 @@ class AuthoritativeDnsServer(BaseDnsServer):
             self.sock.sendto(self._handle_dns_exception(
                 dns_record, e).pack(), 0, address)
         else:
-            self.sock.sendto(self._handle_with_response(
-                dns_record, zc_response).pack(), 0, address)
+            self.sock.sendto(zc_response.pack(), 0, address)
 
     def handle(self, dns_record, address):
         gevent.Greenlet(self._handle_runnable, dns_record, address).start()
@@ -176,7 +199,6 @@ class ZeroConfListener(BaseDnsServer):
         self._greenlet = gevent.Greenlet.spawn(self._greenlet_runnable)
 
     def put(self, dns_record):
-        print "ZeroConfListener.TX"
         super(ZeroConfListener, self).put(dns_record, ('ff02::fb', 5353))
 
     def is_interested(self, listener, dns_record):
